@@ -1,0 +1,7 @@
+[package]
+name = "relisp"
+version = "0.1.0"
+authors = ["Adrien Lamarque <ad@lamarque.fr>"]
+
+[dependencies]
+regex = "*"
