@@ -3,13 +3,14 @@
 
 extern crate regex;
 
-use std::collections::HashMap;
 use regex::{Regex, RegexBuilder};
-use std::io;
-use std::io::prelude::*;
 use std::cell::Cell;
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::io::prelude::*;
+use std::io;
 use std::rc::Rc;
-use std::time::SystemTime;
+// use std::time::SystemTime;
 // use std::Box;
 
 macro_rules! log(
@@ -24,7 +25,7 @@ static DEBUG: bool = true;
 macro_rules! debug(
     ($($arg:tt)*) => { {
         if DEBUG {
-            // let now = SystemTime::now();
+            // TODO: add timestamp
             let r = write!(&mut ::std::io::stderr(), "\x1b[91;40m[DEBUG]\x1b[33;0m ");
             r.unwrap();
             let r = writeln!(&mut ::std::io::stderr(), $($arg)*);
@@ -33,6 +34,10 @@ macro_rules! debug(
     } }
 );
 
+fn debug_dump<S: Debug>(s: S) {
+    debug!("{:?}", s);
+}
+
 fn unimplemented<T>() -> Result<T, String> {
     let res: Result<T, String> = Err("Not implemented yet!".to_string());
     res
@@ -40,7 +45,6 @@ fn unimplemented<T>() -> Result<T, String> {
 
 #[derive(Debug)]
 enum Atom {
-    Nil,
     Int(i64),
     Float(f64),
     // Symbol(String),
@@ -48,10 +52,13 @@ enum Atom {
 }
 
 #[derive(Debug)]
-struct ConsCell {
-    car: Rc<Value>,
-    cdr: Rc<Value>,
-    // is_list: Cell<bool>, 
+enum ConsCell {
+    Nil,
+    Pair {
+        car: Rc<Value>,
+        cdr: Rc<Value>,
+        // is_list: Cell<bool>, 
+    },
 }
 
 #[derive(Debug)]
@@ -60,7 +67,7 @@ enum Value {
     ConsCell(ConsCell),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum TokenType {
     Whitespace,
     Open,
@@ -129,7 +136,7 @@ impl<'a> Lexer<'a> {
                 self.last_read_token = Some(err.clone());
                 return err;
             }
-        })
+        })  
     }
 
     fn peek_token(&mut self) -> Result<(TokenType, &'a str), String> {
@@ -143,6 +150,14 @@ impl<'a> Lexer<'a> {
             return (tt, m);
         })
     }
+
+    fn consume_token(&mut self) -> Result<(), String> {
+        self.next_token().map(|_| ())
+    }
+}
+
+fn eof_error<T>(context: &str) -> Result<T, String> {
+    Err(format!("Unexpected EOF {}", context))
 }
 
 struct Environment<'a> {
@@ -168,10 +183,19 @@ fn parse(input_string: &str) -> Result<Vec<Value>, String> {
         o == "{" && c == "}" 
     }
 
-    fn parse_value(mut lexer: &mut Lexer) -> Result<Value, String> {
+    fn expect(lexer: &mut Lexer, expected_token_type: TokenType) -> Result<(), String> {
+        let (token_type, matched) = try!(lexer.peek_token());
+        if token_type != expected_token_type {
+            Err(format!("Unexpected token {} (type {:?}). Expected {:?}", matched, token_type, expected_token_type))
+        } else {   
+            Ok(())
+        }
+    }
+
+    fn parse_value(lexer: &mut Lexer) -> Result<Value, String> {
         let (token_type, matched) = try!(lexer.next_token());
 
-        debug!("parse_value: {:?} {:?}: ", token_type, matched);
+        // debug!("parse_value: {:?} {:?}: ", token_type, matched);
         match token_type {
             TokenType::Int => {
                 let v = Value::Atom(Atom::Int(matched.parse::<i64>().unwrap()));
@@ -184,20 +208,20 @@ fn parse(input_string: &str) -> Result<Vec<Value>, String> {
             TokenType::Open => {
                 let opening_paren = matched;
 
-                let cell = try!(parse_cell(&mut lexer));
+                let cell = try!(parse_cell(lexer));
 
                 let (_, closing_paren) = try!(lexer.next_token());
                 if !parens_match(opening_paren, closing_paren) {
-                    return Err(format!("Non-matching paren!: {} {}", opening_paren, closing_paren));
+                    return Err(format!("Non-matching paren! {} {}", opening_paren, closing_paren));
                 } else {
                     return Ok(Value::ConsCell(cell));
                 }
             }
             TokenType::Quote => {
-                unreachable!();
+                return unimplemented();
             }
             TokenType::Whitespace => {
-                unreachable!();
+                return unimplemented();
             }
             _ => {
                 Err(format!("Unexpected token {:?} {}", token_type, matched))
@@ -206,13 +230,30 @@ fn parse(input_string: &str) -> Result<Vec<Value>, String> {
     }
 
     fn parse_cell(lexer: &mut Lexer) -> Result<ConsCell, String> {
-        let value = try!(parse_value(lexer));
+        let (token_type, _) = try!(lexer.peek_token());
 
-        let (token_type, matched) = try!(lexer.peek_token());
-        if let TokenType::Dot = token_type {
-        } 
+        if let TokenType::Close = token_type {
+            return Ok(ConsCell::Nil);
+        }
 
-        unimplemented()
+        let car = Rc::new(try!(parse_value(lexer)));
+        let (token_type, _) = try!(lexer.peek_token());
+
+        let cdr_value = match token_type {
+            TokenType::Dot => {
+                try!(lexer.consume_token());
+                let cdr_value = try!(parse_value(lexer));
+                try!(expect(lexer, TokenType::Close));
+                cdr_value
+            }
+            _ => {
+                let cell = try!(parse_cell(lexer));
+                Value::ConsCell(cell)
+            }
+        };
+
+        let cdr = Rc::new(cdr_value);
+        Ok(ConsCell::Pair { car: car, cdr: cdr })
     }
 
     // Lexer test
@@ -238,12 +279,12 @@ fn parse(input_string: &str) -> Result<Vec<Value>, String> {
         let value = try!(parse_value(&mut lexer));
         res.push(value);
 
-        // TODO parse values
+        // TODO parse more values
 
         break;
     }
 
-    return Ok(Vec::new());
+    return Ok(res);
 }
 
 fn print_help() {
@@ -270,7 +311,8 @@ fn main() {
             "" | ":exit" => { log!("Goodbye."); break; }
             ":help" => { print_help(); }
             _ => {
-                let exprs = parse(input_line);
+                let exprs = parse(input_line).map_err(debug_dump);
+                exprs.iter().map(debug_dump).count();
                 // let results = eval(exprs);
                 // print(results);
             }
