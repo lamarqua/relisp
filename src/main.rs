@@ -4,7 +4,6 @@
 extern crate regex;
 
 use regex::{Regex, RegexBuilder};
-// use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::prelude::*;
@@ -47,7 +46,6 @@ enum Atom {
     Int(i64),
     Float(f64),
     String(String),
-    Symbol(String),
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +53,35 @@ enum ConsCell {
     Nil,
     Pair(Box<Value>, Box<Value>),
 }
+
+fn into_vec(list: &ConsCell) -> Option<Vec<Value>> {
+    let mut res: Vec<Value> = Vec::new();
+
+    let mut head: &ConsCell = list;
+    loop {
+        match *head {
+            ConsCell::Nil => {
+                break;
+            }
+            ConsCell::Pair(ref car, ref cdr_value) => {
+                if let Value::ConsCell(ref cdr_cell) = **cdr_value {
+                    res.push(*car.clone());
+                    head = cdr_cell;
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+
+
+    return Some(res);
+}
+
+// impl IntoIterator for ConsCell {
+//     type Item = ConsCell;
+
+// }
 
 struct NativeProc(fn(&ConsCell, &Rc<Environment>) -> Value);
 
@@ -66,7 +93,7 @@ enum ProcedureCode {
 
 impl Debug for NativeProc {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
-        let NativeProc(fptr) = *self;
+        // let NativeProc(fptr) = *self;
         write!(f, "<Native function pointer>")
     }
 }
@@ -82,6 +109,7 @@ impl Clone for NativeProc {
 enum Value {
     Atom(Atom),
     ConsCell(ConsCell),
+    Symbol(String),
     Quote(Box<Value>),
     Procedure(ConsCell, ProcedureCode, Rc<Environment>),
     SpecialForm(String),
@@ -130,8 +158,8 @@ impl<'a> Lexer<'a> {
             (r#"^[+-]?\d*\.\d+(?:[eE][-]\d+)?"#, TokenType::Float),
             (r#"^[+-]?\d+"#, TokenType::Int),
             (r#""(?:[^\\"]|\\.)*""#, TokenType::String),
-            (r#"^lambda|if|quote|set!"#, TokenType::Keyword),
-            (r#"^\w[\w\d_!?+-=/]*"#, TokenType::Symbol),
+            (r#"^lambda|if|quote|define"#, TokenType::Keyword),
+            (r#"^[\w\d_!?+-=/<>*]+"#, TokenType::Symbol),
             (r#"^$"#, TokenType::Eof)];
         let rules = rules_array.into_iter().map(move |x| (build_regex(x.0), x.1.clone())).collect();
         Lexer {
@@ -224,13 +252,14 @@ fn parse(input_string: &str) -> Result<Vec<Value>, String> {
     fn parens_match(o: &str, c: &str) -> bool {
         o == "(" && c == ")" ||
         o == "[" && c == "]" ||
-        o == "{" && c == "}" // TODO: replace with small LUT?
+        o == "{" && c == "}" // maybe replace with small LUT?
     }
 
     fn expect(lexer: &mut Lexer, expected_token_type: TokenType) -> Result<(), String> {
         let (token_type, matched) = try!(lexer.peek_token());
         if token_type != expected_token_type {
-            Err(format!("Unexpected token {} (type {:?}). Expected {:?}", matched, token_type, expected_token_type))
+            Err(format!("Unexpected token {} (type {:?}). Expected {:?}",
+                        matched, token_type, expected_token_type))
         } else {   
             Ok(())
         }
@@ -266,7 +295,7 @@ fn parse(input_string: &str) -> Result<Vec<Value>, String> {
                 Ok(v)
             }
             TokenType::Symbol => {
-                let v = Value::Atom(Atom::Symbol(matched.to_string()));
+                let v = Value::Symbol(matched.to_string());
                 Ok(v)
             }
             TokenType::Quote => {
@@ -349,10 +378,15 @@ fn eval(value: &Value, env: Rc<Environment>) -> Result<Value, String> {
 
         match *body {
             ProcedureCode::InterpretredProc(_) => {
+                let mut cur_arg_name = arg_names;
                 loop {
-                    match *arg_names {
-                        ConsCell::Nil => (),
-                        ConsCell::Pair(_, _) => (),
+                    match *cur_arg_name {
+                        ConsCell::Nil => {
+                            
+                        }
+                        ConsCell::Pair(ref car, ref cdr) => {
+
+                        }
                     }
                 }
             }
@@ -367,19 +401,34 @@ fn eval(value: &Value, env: Rc<Environment>) -> Result<Value, String> {
 
     match *value {
         Value::Atom(_) => Ok(value.clone()),
-        Value::Quote(_) => Ok(value.clone()),
+        Value::Quote(ref quoted_val) => Ok(*quoted_val.clone()),
         Value::Procedure(_, _, _) => Ok(value.clone()),
         Value::ConsCell(ConsCell::Nil) => Ok(value.clone()),
+        Value::Symbol(ref symbol_name) => env.lookup(&symbol_name)
+                                        .ok_or(format!("Unknown symbol {}", &symbol_name))
+                                        .map(|x| x.clone()),
         Value::SpecialForm(ref keyword) => {
             Err(format!("Invalid syntax with special form {}", keyword))
         }
         Value::ConsCell(ConsCell::Pair(ref car, ref cdr)) => {
-            let evald_car = try!(eval(car.as_ref(), env.clone()));
-            
+            // we're going to be a special form or a function call; we need
+            // to check that the arguments are a "true" list (i.e. ends with Nil)
             let cdr_cell = match *cdr.as_ref() {
                 Value::ConsCell(ref cell) => cell,
-                _ => { return Err(format!("Expected a list: {:?}", cdr)); }
+                _ => { return Err(format!("Found a pair, expected a list: {:?}", cdr)); }
             };
+
+            let args_vec = match into_vec(&cdr_cell) {
+                Some(vec) => vec,
+                _ => {
+                    return Err(format!("Expected a list. Bad syntax for arguments: {:?}", cdr_cell));
+                }
+            };
+
+            debug!("Args = {:?}", args_vec);
+
+            let evald_car = try!(eval(car.as_ref(), env.clone()));
+
             match evald_car {
                 Value::Procedure(ref arg_names, ref body, ref env) => {
                     return call_proc(env, &arg_names, &cdr_cell, body);
@@ -417,7 +466,7 @@ fn repl(env: &Rc<Environment>) {
         let input_line: &str = raw_input_line.trim();
 
         match input_line {
-            "" | ":exit" => { log!("Goodbye."); break; }
+            "" | ":exit" => { log!("\nGoodbye."); break; }
             ":help" => { print_help(); }
             _ => {
                 match parse(input_line) {
@@ -443,9 +492,6 @@ fn main() {
     debug!("DEBUG activated");
     
     let global_env = Rc::new(Environment::new(None));
-    // init_env
-    // read_prelude, interpret_prelude
-    // parse_cmd_line
-    // read_file, interpret_file
+
     repl(&global_env);
 }
