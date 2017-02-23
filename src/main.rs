@@ -9,7 +9,11 @@ use std::fmt::Debug;
 use std::io::prelude::*;
 use std::io;
 use std::rc::Rc;
+use std::fs::File;
+use std::cell::RefCell;
 
+
+// -- UTILS -- 
 macro_rules! log(
     ($($arg:tt)*) => { {
         let r = write!(&mut ::std::io::stderr(), $($arg)*);
@@ -41,8 +45,10 @@ fn unimplemented<T>() -> Result<T, String> {
     res
 }
 
+// -- Data structures -- 
 #[derive(Debug, Clone)]
-enum Atom {
+enum Primitive {
+    Bool(bool),
     Int(i64),
     Float(f64),
     String(String),
@@ -54,7 +60,7 @@ enum ConsCell {
     Pair(Box<Value>, Box<Value>),
 }
 
-fn into_vec(list: &ConsCell) -> Option<Vec<Value>> {
+fn to_vec(list: &ConsCell) -> Option<Vec<Value>> {
     let mut res: Vec<Value> = Vec::new();
 
     let mut head: &ConsCell = list;
@@ -74,21 +80,28 @@ fn into_vec(list: &ConsCell) -> Option<Vec<Value>> {
         }
     }
 
-
     return Some(res);
 }
 
-// impl IntoIterator for ConsCell {
-//     type Item = ConsCell;
+struct NativeProc(fn(Vec<Value>, &SharedEnv) -> Result<Value, String>);
 
-// }
-
-struct NativeProc(fn(&ConsCell, &Rc<Environment>) -> Value);
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum ProcedureCode {
-    InterpretredProc(Box<Value>),
+    InterpretedProc(Vec<String>, Vec<Value>, SharedEnv),
     NativeProc(NativeProc),
+}
+
+impl Debug for ProcedureCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        match self {
+            &ProcedureCode::InterpretedProc(ref arg_names, ref body_exprs, _) => {
+                write!(f, "args: {:?}, body: {:?}", arg_names, body_exprs)
+            }
+            &ProcedureCode::NativeProc(ref np) => {
+                write!(f, "{:?}", np)
+            }
+        }
+    }
 }
 
 impl Debug for NativeProc {
@@ -107,13 +120,16 @@ impl Clone for NativeProc {
 
 #[derive(Debug, Clone)]
 enum Value {
-    Atom(Atom),
+    Primitive(Primitive),
     ConsCell(ConsCell),
     Symbol(String),
     Quote(Box<Value>),
-    Procedure(ConsCell, ProcedureCode, Rc<Environment>),
+    Procedure(ProcedureCode),
     SpecialForm(String),
 }   
+
+
+// -- Lexing, parsing & interpreter --
 
 #[derive(Clone, Debug, PartialEq)]
 enum TokenType {
@@ -121,6 +137,7 @@ enum TokenType {
     Comment,
     Dot,
     Eof,
+    BoolLiteral,
     Float,
     Int,
     Open,
@@ -159,6 +176,7 @@ impl<'a> Lexer<'a> {
             (r#"^[+-]?\d+"#, TokenType::Int),
             (r#""(?:[^\\"]|\\.)*""#, TokenType::String),
             (r#"^lambda|if|quote|define"#, TokenType::Keyword),
+            (r#"^true|false|\#true|\#false|\#t|\#f"#, TokenType::BoolLiteral),
             (r#"^[\w\d_!?+-=/<>*]+"#, TokenType::Symbol),
             (r#"^$"#, TokenType::Eof)];
         let rules = rules_array.into_iter().map(move |x| (build_regex(x.0), x.1.clone())).collect();
@@ -220,11 +238,11 @@ fn eof_error<T>(context: &str) -> Result<T, String> {
 #[derive(Debug)]
 struct Environment {
     table: HashMap<String, Value>,
-    parent: Option<Rc<Environment>>
+    parent: Option<SharedEnv>
 }
 
 impl Environment {
-    fn new(parent: Option<Rc<Environment>>) -> Self {
+    fn new(parent: Option<SharedEnv>) -> Self {
         Environment {
             table: HashMap::new(),
             parent: parent,
@@ -235,24 +253,28 @@ impl Environment {
         self.table.insert(symbol.to_string(), value);
     }
 
-    fn lookup(&self, symbol: &str) -> Option<&Value> {
+    fn lookup(&self, symbol: &str) -> Option<Value> {
         if self.table.contains_key(symbol) {
-            self.table.get(symbol).clone()
+            return self.table.get(symbol).cloned()
         } else {
-            self.parent.as_ref().and_then(|parent| {
-                parent.lookup(symbol)
-            })
+            if let Some(ref parent) = self.parent {
+                return parent.borrow().lookup(symbol);
+            }
         }
+        return None;
     }
 }
+
+type SharedEnv = Rc<RefCell<Environment>>;
 
 fn parse(input_string: &str) -> Result<Vec<Value>, String> {
     let mut lexer = Lexer::new(input_string);
 
     fn parens_match(o: &str, c: &str) -> bool {
-        o == "(" && c == ")" ||
-        o == "[" && c == "]" ||
-        o == "{" && c == "}" // maybe replace with small LUT?
+        match (o, c) {
+            ("(", ")") | ("[", "]") | ("{", "}") => true,
+            _ => false
+        }
     }
 
     fn expect(lexer: &mut Lexer, expected_token_type: TokenType) -> Result<(), String> {
@@ -269,13 +291,13 @@ fn parse(input_string: &str) -> Result<Vec<Value>, String> {
         let (token_type, matched) = try!(lexer.next_token());
 
         // debug!("parse_value: {:?} {:?}: ", token_type, matched);
-        match token_type { // we also parse the atoms directly
+        match token_type { // we also parse the primitive types directly
             TokenType::Int => {
-                let v = Value::Atom(Atom::Int(matched.parse::<i64>().unwrap()));
+                let v = Value::Primitive(Primitive::Int(matched.parse::<i64>().unwrap()));
                 return Ok(v);
             }
             TokenType::Float => {
-                let v = Value::Atom(Atom::Float(matched.parse::<f64>().unwrap()));
+                let v = Value::Primitive(Primitive::Float(matched.parse::<f64>().unwrap()));
                 return Ok(v);
             }
             TokenType::Open => {
@@ -290,8 +312,15 @@ fn parse(input_string: &str) -> Result<Vec<Value>, String> {
                     return Ok(Value::ConsCell(cell));
                 }
             }
+            TokenType::BoolLiteral => {
+                let v = match matched {
+                    "#t" | "#true" | "true" => Value::Primitive(Primitive::Bool(true)),
+                    _ => Value::Primitive(Primitive::Bool(false)),
+                };
+                return Ok(v);
+            }
             TokenType::String => {
-                let v = Value::Atom(Atom::String(matched[1..matched.len()-1].to_string()));
+                let v = Value::Primitive(Primitive::String(matched[1..matched.len()-1].to_string()));
                 Ok(v)
             }
             TokenType::Symbol => {
@@ -340,24 +369,6 @@ fn parse(input_string: &str) -> Result<Vec<Value>, String> {
         Ok(ConsCell::Pair(car, cdr))
     }
 
-    // Lexer test
-    // TODO: make it a proper test
-    // loop {
-    //     let r = lexer.next_token();
-    //     match r {
-    //         Ok((tt, n)) => {
-    //             debug!("{:?} {}", tt, n);
-    //             if let TokenType::Eof = tt {
-    //                 break;
-    //             }
-    //         }
-    //         Err(s) => {
-    //             debug!("Err in lexer() {}", s);
-    //             break;
-    //         }
-    //     }
-    // }
-
     let mut res = Vec::new();
     loop {
         let (token_type, _) = try!(lexer.peek_token());
@@ -371,88 +382,161 @@ fn parse(input_string: &str) -> Result<Vec<Value>, String> {
     return Ok(res);
 }
 
-fn eval(value: &Value, env: Rc<Environment>) -> Result<Value, String> {
-    fn call_proc(env: &Rc<Environment>, arg_names: &ConsCell, arg_values: &ConsCell, body: &ProcedureCode) -> Result<Value, String> {
+fn eval(value: &Value, env: SharedEnv) -> Result<Value, String> {
+    fn call_proc(args: &[Value], procedure: &ProcedureCode, call_env: &SharedEnv) -> Result<Value, String> {
+        match procedure {
+            &ProcedureCode::InterpretedProc(ref arg_names, ref exprs, ref capture_env) => {
+                let local_env = Rc::new(RefCell::new(Environment::new(Some(capture_env.clone()))));
 
-        let proc_env = Environment::new(Some(env.clone()));
+                {
+                    let mut borrowed_local_env = local_env.borrow_mut();
 
-        match *body {
-            ProcedureCode::InterpretredProc(_) => {
-                let mut cur_arg_name = arg_names;
-                loop {
-                    match *cur_arg_name {
-                        ConsCell::Nil => {
-                            
-                        }
-                        ConsCell::Pair(ref car, ref cdr) => {
-
-                        }
+                    for (arg_name, arg_expr) in arg_names.iter().zip(args.iter()) {
+                        let arg_val = try!(eval(arg_expr, call_env.clone()));
+                        borrowed_local_env.insert(arg_name, arg_val);
                     }
                 }
-            }
-            ProcedureCode::NativeProc(NativeProc(ref fun)) => {
-                let result = fun(arg_values, &env);
 
+                // debug_dump(&capture_env);
+                let mut res: Result<Value, String> = Err(format!("Internal error. (Empty procedure body)"));
+                for e in exprs.iter() {
+                    res = eval(e, local_env.clone());
+                    if res.is_err() {
+                        return res;
+                    }
+                }
+                return res;
+            }
+            &ProcedureCode::NativeProc(NativeProc(ref f)) => {
+                let mut evald_args = Vec::new();
+                for arg in args {
+                    let v = try!(eval(&arg, call_env.clone()));
+                    evald_args.push(v);
+                }
+                return f(evald_args, &call_env);
+            }
+        }
+    }
+
+    fn call_special_form(env: SharedEnv, keyword: &str, sf_args: &[Value]) -> Result<Value, String> {
+        match keyword {
+            "lambda" => {
+                let mut arg_names: Vec<String> = Vec::new();
+
+                match &sf_args[0] {
+                    &Value::ConsCell(ref fun_args) => { 
+                        let arg_names_values: Vec<Value> = try!(to_vec(fun_args)
+                            .ok_or(format!("Got a non-pure list for arguments. {:?}", fun_args)));
+
+                        for arg in arg_names_values {
+                            match arg {
+                                Value::Symbol(ref s) => arg_names.push(s.clone()),
+                                _ => {
+                                    return Err(format!("Non-symbol argument found in argument list. {:?}", arg_names))
+                                }
+                            }
+                        }
+                    },
+                    _ => { return Err(format!("Expected list of arguments for lambda. {:?}", sf_args[0])) }
+                };
+
+                let proc_body = sf_args[1..].to_vec();
+                debug_dump(&proc_body);
+
+                let proc_code = ProcedureCode::InterpretedProc(arg_names, proc_body, env.clone());
+                return Ok(Value::Procedure(proc_code));
+            }
+
+            "define" => {
+                let symbol_name = match &sf_args[0] {
+                    &Value::Symbol(ref s) => s,
+                    _ => {
+                        return Err(format!("Expected a symbol for define. {:?}", &sf_args[0]));
+                    }
+                };
+                if sf_args.len() > 2 {
+                    return Err(format!("Too many expressions for define. {:?}", sf_args));
+                }
+
+                let res = try!(eval(&sf_args[1], env.clone()));
+                env.borrow_mut().insert(symbol_name, res.clone());
+
+                return Ok(res);
+            }
+
+            "quote" => {
+                if sf_args.len() > 1 {
+                    return Err(format!("Too many arguments for quote {:?}", sf_args));
+                }
+                return Ok(Value::Quote(Box::new(sf_args[0].clone())));
+            }
+
+            "if" => {
+                if sf_args.len() != 3 {
+                    return Err(format!("Invalid number of arguments for if {:?}", sf_args));
+                }
+                if let Value::Primitive(Primitive::Bool(b)) = sf_args[0] {
+                    if !b {
+                        return eval(&sf_args[2], env.clone());
+                    }
+                }
+                return eval(&sf_args[1], env.clone());
+            }
+
+            &_ => {
+                debug_dump(format!("Tried to call unknown special form {} in call_special_form", keyword));
+                return Err("Internal error".to_string());
             }
         }
 
-        unimplemented()
     }
 
     match *value {
-        Value::Atom(_) => Ok(value.clone()),
+        Value::Primitive(_) => Ok(value.clone()),
         Value::Quote(ref quoted_val) => Ok(*quoted_val.clone()),
-        Value::Procedure(_, _, _) => Ok(value.clone()),
+        Value::Procedure(..) => Ok(value.clone()),
         Value::ConsCell(ConsCell::Nil) => Ok(value.clone()),
-        Value::Symbol(ref symbol_name) => env.lookup(&symbol_name)
+        Value::Symbol(ref symbol_name) => env.borrow().lookup(&symbol_name)
                                         .ok_or(format!("Unknown symbol {}", &symbol_name))
                                         .map(|x| x.clone()),
         Value::SpecialForm(ref keyword) => {
             Err(format!("Invalid syntax with special form {}", keyword))
         }
-        Value::ConsCell(ConsCell::Pair(ref car, ref cdr)) => {
-            // we're going to be a special form or a function call; we need
-            // to check that the arguments are a "true" list (i.e. ends with Nil)
-            let cdr_cell = match *cdr.as_ref() {
-                Value::ConsCell(ref cell) => cell,
-                _ => { return Err(format!("Found a pair, expected a list: {:?}", cdr)); }
-            };
-
-            let args_vec = match into_vec(&cdr_cell) {
+        Value::ConsCell(ref cell) => {
+            let call_vec = match to_vec(cell) {
                 Some(vec) => vec,
-                _ => {
-                    return Err(format!("Expected a list. Bad syntax for arguments: {:?}", cdr_cell));
+                None => { 
+                    return Err(format!("Found empty list. Bad syntax for function / special form call: {:?}", cell));
                 }
             };
 
-            debug!("Args = {:?}", args_vec);
+            if let Value::SpecialForm(ref keyword) = call_vec[0] {
+                return call_special_form(env.clone(), keyword, &call_vec[1..]);                
+            }
+            else {
+                let evald_first_elem = try!(eval(&call_vec[0], env.clone()));
 
-            let evald_car = try!(eval(car.as_ref(), env.clone()));
-
-            match evald_car {
-                Value::Procedure(ref arg_names, ref body, ref env) => {
-                    return call_proc(env, &arg_names, &cdr_cell, body);
+                if let Value::Procedure(ref procedure) = evald_first_elem {
+                    return call_proc(&call_vec[1..], procedure, &env);
                 }
-                Value::SpecialForm(keyword) => {
-                    return unimplemented();
+                else {
+                    return Err(format!("Found non-callable object. Bad syntax for function / special form call: {:?}", evald_first_elem));                    
                 }
-                _ => { return Err(format!("Expected a procedure: {:?}", evald_car)); }
-            };
+            }
         }
     }
 }
 
-fn print(value: Value) -> () {
+fn print_value(value: &Value) -> () {
     log!("{:?}\n", value);
 }
 
 fn print_help() {
-    log!(":load (or :l) to load an external file\n");
-    log!(":exit to quit\n");
+    log!("\\n or :exit to quit\n");
 }
 
-fn repl(env: &Rc<Environment>) {
-    let repl_env = Rc::new(Environment::new(Some(env.clone())));
+fn repl(env: &SharedEnv) {
+    // let repl_env = Rc::new(Environment::new(Some(env.clone())));
     loop {
         log!("λ ");
 
@@ -473,9 +557,9 @@ fn repl(env: &Rc<Environment>) {
                     Ok(exprs) => {
                         for e in exprs.into_iter() {
                             // debug_dump(&e);
-                            let result = eval(&e, repl_env.clone());
+                            let result = eval(&e, env.clone());
                             match result {
-                                Ok(v) => print(v),
+                                Ok(v) => print_value(&v),
                                 Err(e) => log!("Error: {}\n", e),
                             }
                         }
@@ -487,11 +571,83 @@ fn repl(env: &Rc<Environment>) {
     }
 }
 
+// -- RUNTIME --
+fn sum(args: Vec<Value>, env: &SharedEnv) -> Result<Value, String> {
+    if args.len() == 0 {
+        return Err(format!("Missing arguments for + function"));
+    }
+    match args[0] {
+        Value::Primitive(Primitive::Int(i)) => {
+            let mut acc: i64 = i;
+            for v in args[1..].iter() {
+                match v {
+                    &Value::Primitive(Primitive::Int(j)) => { acc += j; }
+                    _ => { return Err(format!("Inconsistent types for summation {:?}", v)); }
+                }
+            }
+            return Ok(Value::Primitive(Primitive::Int(acc)));
+        }
+        Value::Primitive(Primitive::Float(f)) => {
+            let mut acc: f64 = f;
+            for v in args[1..].iter() {
+                match v {
+                    &Value::Primitive(Primitive::Float(j)) => { acc += j; }
+                    _ => { return Err(format!("Inconsistent types for summation {:?}", v)); }
+                }
+            }
+
+            return Ok(Value::Primitive(Primitive::Float(acc)));
+        }
+        _ => {
+            return Err(format!("Type is not summable {:?}", &args[0]));
+        }
+    }
+}
+
+fn init_env(env: &SharedEnv) -> () {
+    let mut borrow = env.borrow_mut();
+    borrow.insert("nil", Value::ConsCell(ConsCell::Nil));
+    borrow.insert("+", Value::Procedure(ProcedureCode::NativeProc(NativeProc(sum))));
+}
+
+// -- REPL --
+fn read_file(filename: &str) -> Result<String, String> {
+
+    let mut file = try!(File::open(filename).map_err(|e| e.to_string()));
+
+    let mut contents = String::new();
+    let _ = try!(file.read_to_string(&mut contents).map_err(|e| e.to_string()));
+
+    return Ok(contents);
+}
+
+fn eval_file(contents: &str, env: &SharedEnv) -> Result<(), String> {
+    let exprs = try!(parse(&contents));
+
+    for e in exprs.into_iter() {
+        print_value(&try!(eval(&e, env.clone())));
+    }
+
+    return Ok(());
+}
+
+fn load_file(filename: &str, env: &SharedEnv) -> Result<(), String> {
+    let contents = try!(read_file(filename));
+    return eval_file(&contents, env);
+}
+
+
 fn main() {
     log!("(R)ust (E)xperiments in (LISP)\n");
     debug!("DEBUG activated");
-    
-    let global_env = Rc::new(Environment::new(None));
+
+    let global_env = Rc::new(RefCell::new(Environment::new(None)));
+
+    init_env(&global_env);
+
+    if let Err(e) = load_file("src/prelude.lisp", &global_env) {
+        log!("Error while loading prelude file. {}\n", e);
+    }
 
     repl(&global_env);
 }

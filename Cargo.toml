@@ -1,6 +1,6 @@
 [package]
 name = "relisp"
-version = "0.2.0"
+version = "0.9.0"
 authors = ["Adrien Lamarque <ad@lamarque.fr>"]
 
 [dependencies]
